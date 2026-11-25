@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
-from .client import EadClient, EadAuthError
+from .client import EadApiError, EadClient, EadAuthError
 from .heuristics import KINDS, classify_material, matches
 
 mcp = MCPServer(
@@ -22,6 +25,31 @@ mcp = MCPServer(
 _client: EadClient | None = None
 
 
+def _friendly(fn):
+    """Converte falhas previstas em ToolError, para a mensagem chegar ao modelo.
+
+    Sem isso o SDK devolve so "Error executing tool X" e o cliente nao sabe se
+    foi senha errada, EAD fora do ar ou erro do Moodle.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await fn(*args, **kwargs)
+        except (EadAuthError, EadApiError) as e:
+            raise ToolError(str(e)) from e
+        except httpx.HTTPStatusError as e:
+            raise ToolError(f"EAD respondeu HTTP {e.response.status_code} em {e.request.url.path}.") from e
+        except httpx.TransportError as e:
+            raise ToolError(
+                "Nao foi possivel conectar ao EAD (ead.puc-rio.br): rede/DNS indisponivel ou site fora do ar. "
+                "Nao e problema de login nem de sessao expirada; tente de novo mais tarde. "
+                f"Detalhe: {type(e).__name__}: {e}"
+            ) from e
+
+    return wrapper
+
+
 def _ead() -> EadClient:
     global _client
     if _client is None:
@@ -30,6 +58,7 @@ def _ead() -> EadClient:
 
 
 @mcp.tool()
+@_friendly
 async def login(matricula: str, senha: str) -> dict[str, Any]:
     """Faz login no EAD. Normalmente desnecessário (env vars autoriza no startup)."""
     global _client
@@ -41,6 +70,7 @@ async def login(matricula: str, senha: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_friendly
 async def list_courses(classification: str = "inprogress") -> list[dict[str, Any]]:
     """Lista matérias do usuário. classification: inprogress|future|past|favourites|all."""
     courses = await _ead().list_courses(classification=classification)
@@ -48,6 +78,7 @@ async def list_courses(classification: str = "inprogress") -> list[dict[str, Any
 
 
 @mcp.tool()
+@_friendly
 async def get_course_structure(course_id: int) -> dict[str, Any]:
     """Retorna árvore do curso: seções + módulos (id, nome, tipo, url)."""
     state = await _ead().get_course_state(course_id)
@@ -55,6 +86,7 @@ async def get_course_structure(course_id: int) -> dict[str, Any]:
 
 
 @mcp.tool()
+@_friendly
 async def search_materials(
     course_id: int,
     query: str = "",
@@ -91,6 +123,7 @@ async def search_materials(
 
 
 @mcp.tool()
+@_friendly
 async def download_material(cm_id: int, dest_dir: str | None = None) -> dict[str, Any]:
     """Baixa um resource. Retorna {path, filename, content_type, size_bytes}."""
     f = await _ead().download_material(cm_id, dest_dir=dest_dir)
@@ -127,18 +160,21 @@ async def _bulk_by_kind(course_id: int, kind: str, dest_dir: str | None) -> dict
 
 
 @mcp.tool()
+@_friendly
 async def download_all_slides(course_id: int, dest_dir: str | None = None) -> dict[str, Any]:
     """Baixa todos resources classificados como slide. Retorna lista com paths."""
     return await _bulk_by_kind(course_id, "slide", dest_dir)
 
 
 @mcp.tool()
+@_friendly
 async def download_all_provas(course_id: int, dest_dir: str | None = None) -> dict[str, Any]:
     """Baixa todos resources classificados como prova. Retorna lista com paths."""
     return await _bulk_by_kind(course_id, "prova", dest_dir)
 
 
 @mcp.tool()
+@_friendly
 async def get_page_content(cm_id: int, as_text: bool = True) -> dict[str, Any]:
     """Extrai conteudo de um mod_page. as_text=True retorna texto; False retorna HTML."""
     page = await _ead().fetch_page(cm_id)
@@ -153,7 +189,9 @@ async def _main() -> None:
         if ead.matricula and ead.senha:
             try:
                 await ead.login()
-            except EadAuthError:
+            except Exception:
+                # Senha errada ou EAD/rede fora do ar: sobe mesmo assim;
+                # as tools tentam logar de novo na primeira chamada.
                 pass
         await mcp.run_stdio_async()
     finally:
